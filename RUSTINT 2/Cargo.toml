@@ -1,6 +1,6 @@
 [package]
 name = "rustint"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Linux-first passive OSINT toolkit for authorized research"
 license = "MIT"
@@ -10,6 +10,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+csv = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 trust-dns-resolver = { version = "0.23", features = ["tokio-runtime"] }

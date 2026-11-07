@@ -1,1 +1,11 @@
 dns-report.json
+
+# Build artifacts
+/target/
+
+# Generated reports
+*.csv
+*.json
+
+# Local backups
+src/main.rs.v02-backup

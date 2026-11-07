@@ -97,35 +97,113 @@ async fn email_result(address: &str) -> Result<Value> {
     }))
 }
 
+
+
+
 async fn subdomains_result(domain: &str) -> Result<Value> {
     let domain = normalize_domain(domain)?;
     let url = format!("https://crt.sh/?q=%25.{}&output=json", domain);
-    let response = reqwest::Client::builder()
-        .user_agent("RUSTINT/0.2 (passive certificate-transparency lookup)")
-        .timeout(std::time::Duration::from_secs(25))
-        .build()?
-        .get(&url).send().await?;
+
+    let client = reqwest::Client::builder()
+        .user_agent("RUSTINT/0.3 (passive subdomain discovery)")
+        .timeout(std::time::Duration::from_secs(60))
+        .build()?;
+
+    let response = client.get(&url).send().await?;
     let status = response.status();
     anyhow::ensure!(status.is_success(), "crt.sh returned HTTP {status}");
-    let rows: Vec<Value> = response.json().await.context("crt.sh response was not valid JSON")?;
+
+    let rows: Vec<Value> = response.json().await
+        .context("crt.sh response was not valid JSON")?;
+
     let suffix = format!(".{domain}");
     let mut names = BTreeSet::new();
+
     for row in rows {
         if let Some(value) = row.get("name_value").and_then(Value::as_str) {
             for item in value.lines() {
-                let name = item.trim().trim_start_matches("*.").trim_end_matches('.').to_ascii_lowercase();
+                let name = item.trim()
+                    .trim_start_matches("*.")
+                    .trim_end_matches('.')
+                    .to_ascii_lowercase();
+
                 if name == domain || name.ends_with(&suffix) {
                     names.insert(name);
                 }
             }
         }
     }
+
+    let resolver = TokioAsyncResolver::tokio(
+        ResolverConfig::default(),
+        ResolverOpts::default()
+    );
+
+    let mut results = Vec::new();
+    let mut resolved_count = 0usize;
+    let mut unresolved_count = 0usize;
+
+    for name in names {
+        let a_lookup = resolver.lookup(&name, RecordType::A).await;
+        let aaaa_lookup = resolver.lookup(&name, RecordType::AAAA).await;
+
+        let (a_records, a_error) = match a_lookup {
+            Ok(lookup) => (
+                lookup.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
+                None
+            ),
+            Err(error) => (Vec::new(), Some(error.to_string()))
+        };
+
+        let (aaaa_records, aaaa_error) = match aaaa_lookup {
+            Ok(lookup) => (
+                lookup.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
+                None
+            ),
+            Err(error) => (Vec::new(), Some(error.to_string()))
+        };
+
+        let has_address = !a_records.is_empty() || !aaaa_records.is_empty();
+
+        let a_no_records = a_error.as_ref().map_or(false, |e| {
+            e.contains("no record found")
+        });
+        let aaaa_no_records = aaaa_error.as_ref().map_or(false, |e| {
+            e.contains("no record found")
+        });
+
+        let has_error = (a_error.is_some() && !a_no_records)
+            || (aaaa_error.is_some() && !aaaa_no_records);
+
+        let state = if has_address {
+            resolved_count += 1;
+            "resolved"
+        } else if has_error {
+            unresolved_count += 1;
+            "lookup_error"
+        } else {
+            unresolved_count += 1;
+            "no_dns_answer"
+        };
+
+        results.push(json!({
+            "hostname": name,
+            "status": state,
+            "A": a_records,
+            "AAAA": aaaa_records,
+            "A_error": a_error,
+            "AAAA_error": aaaa_error
+        }));
+    }
+
     Ok(json!({
         "domain": domain,
         "source": "crt.sh (public Certificate Transparency logs)",
-        "count": names.len(),
-        "subdomains": names.into_iter().collect::<Vec<_>>(),
-        "note": "Passive certificate-log discovery only. Results may include historical names and do not prove a host is currently active."
+        "count": results.len(),
+        "resolved_count": resolved_count,
+        "unresolved_count": unresolved_count,
+        "subdomains": results,
+        "note": "DNS resolution does not prove that a website is reachable or that a service is running. Lookup errors are reported separately."
     }))
 }
 
@@ -137,7 +215,7 @@ async fn rdap_result(target: &str) -> Result<Value> {
     };
     let response = reqwest::Client::builder()
         .user_agent("RUSTINT/0.2 (passive OSINT)")
-        .timeout(std::time::Duration::from_secs(25))
+        .timeout(std::time::Duration::from_secs(60))
         .build()?.get(url).send().await?;
     let status = response.status();
     let body: Value = response.json().await.context("RDAP response was not valid JSON")?;
@@ -161,6 +239,67 @@ fn ip_result(address: &str) -> Result<Value> {
     })
 }
 
+
+fn csv_report(tool: &str, result: &Value) -> Result<String> {
+    let mut writer = csv::Writer::from_writer(Vec::new());
+
+    if tool == "subdomains" {
+        writer.write_record(["hostname", "status", "A", "AAAA"])?;
+
+        if let Some(items) = result["subdomains"].as_array() {
+            for item in items {
+                writer.write_record([
+                    item["hostname"].as_str().unwrap_or(""),
+                    item["status"].as_str().unwrap_or(""),
+                    &item["A"].as_array()
+                        .map(|v| v.iter().filter_map(Value::as_str)
+                        .collect::<Vec<_>>().join(";"))
+                        .unwrap_or_default(),
+                    &item["AAAA"].as_array()
+                        .map(|v| v.iter().filter_map(Value::as_str)
+                        .collect::<Vec<_>>().join(";"))
+                        .unwrap_or_default(),
+                ])?;
+            }
+        }
+    } else {
+        writer.write_record(["field", "value"])?;
+
+        fn flatten(
+            writer: &mut csv::Writer<Vec<u8>>,
+            prefix: &str,
+            value: &Value
+        ) -> Result<()> {
+            match value {
+                Value::Object(map) => {
+                    for (key, child) in map {
+                        let path = if prefix.is_empty() {
+                            key.clone()
+                        } else {
+                            format!("{prefix}.{key}")
+                        };
+                        flatten(writer, &path, child)?;
+                    }
+                }
+                Value::Array(items) => {
+                    for (index, child) in items.iter().enumerate() {
+                        flatten(writer, &format!("{prefix}[{index}]"), child)?;
+                    }
+                }
+                _ => {
+                    writer.write_record([prefix, &value.to_string()])?;
+                }
+            }
+            Ok(())
+        }
+
+        flatten(&mut writer, "", result)?;
+    }
+
+    let bytes = writer.into_inner()?;
+    Ok(String::from_utf8(bytes)?)
+}
+
 async fn run() -> Result<()> {
     let cli = Cli::parse();
     let (tool, target, result) = match &cli.command {
@@ -180,9 +319,20 @@ async fn run() -> Result<()> {
     let document = json!({"tool": tool, "target": target, "result": result});
     let rendered = serde_json::to_string_pretty(&document)?;
     if let Some(path) = cli.output {
-        fs::write(&path, format!("{rendered}\n"))
+        let extension = path.extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        let (content, format) = match extension.as_str() {
+            "json" => (format!("{rendered}\n"), "JSON"),
+            "csv" => (csv_report(tool, &result)?, "CSV"),
+            _ => anyhow::bail!("Unsupported report format. Use .json or .csv"),
+        };
+
+        fs::write(&path, content)
             .with_context(|| format!("Could not write report to {}", path.display()))?;
-        println!("[+] JSON report saved to {}", path.display());
+        println!("[+] {format} report saved to {}", path.display());
     } else {
         println!("{tool}: {target}");
         println!("{}", serde_json::to_string_pretty(&document["result"])?);
